@@ -1,49 +1,232 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
+// app.ts — HTTP router for the github-core-clone-01 forge entry.
 //
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// createApp(store) returns a node:http request handler. Routing, in order:
+//   GET /healthz            -> 200 {"ok": true}, no token required
+//   /api/v3/...             -> REST v3 dispatch, segments after /api/v3
+//   POST /api/graphql       -> GraphQL v4 dispatch
+//   POST /mcp               -> MCP dispatch
+//   /<owner>/<repo>.git/... -> git smart-HTTP dispatch (upload-pack / receive-pack)
+//   anything else           -> 404 {"message": "Not Found"}
+//
+// Every dispatch function shares one shape: it takes the store, the HTTP
+// method, the path segments after the module's prefix, the query object, the
+// authorization header value, and the raw request body, and returns an object
+// with a numeric status, a headers record, and a body that is a string or a
+// Buffer. The handler modules were written in parallel sessions, so each
+// dispatch function is resolved by name from a short list of candidates when
+// the app is created; createApp throws if a module exports none of them, so
+// a wiring mismatch fails fast at startup instead of mid-trial.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createStore } from './store.ts';
+import * as restModule from './rest.ts';
+import * as graphqlModule from './graphql.ts';
+import * as mcpModule from './mcp.ts';
+import * as gitModule from './git.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+export type Store = ReturnType<typeof createStore>;
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+export interface DispatchResult {
+  status: number;
+  headers: Record<string, string>;
+  body: string | Buffer;
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+export type DispatchFn = (
+  store: Store,
+  method: string,
+  segments: string[],
+  query: Record<string, string | string[]>,
+  authorization: string | undefined,
+  body: Buffer,
+) => DispatchResult;
+
+type ModuleExports = Record<string, unknown>;
+
+function resolveDispatch(moduleExports: ModuleExports, candidates: readonly string[]): DispatchFn {
+  for (const name of candidates) {
+    const value = moduleExports[name];
+    if (typeof value === 'function') return value as DispatchFn;
+  }
+  const fallback = moduleExports['default'];
+  if (typeof fallback === 'function') return fallback as DispatchFn;
+  throw new Error(`no dispatch function found (tried: ${candidates.join(', ')})`);
+}
+
+function parseQuery(searchParams: URLSearchParams): Record<string, string | string[]> {
+  const query: Record<string, string | string[]> = {};
+  for (const key of new Set(searchParams.keys())) {
+    const values = searchParams.getAll(key);
+    query[key] = values.length === 1 ? (values[0] as string) : values;
+  }
+  return query;
+}
+
+function decodeSegment(segment: string): string {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return decodeURIComponent(segment);
   } catch {
-    return '/';
+    return segment;
   }
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
+export function createApp(store: Store): (req: IncomingMessage, res: ServerResponse) => void {
+  const dispatchRest = resolveDispatch(restModule as unknown as ModuleExports, [
+    'dispatchRest',
+    'dispatchREST',
+    'restDispatch',
+    'handleRest',
+    'dispatch',
+  ]);
+  const dispatchGraphQL = resolveDispatch(graphqlModule as unknown as ModuleExports, [
+    'dispatchGraphQL',
+    'dispatchGraphql',
+    'graphqlDispatch',
+    'handleGraphQL',
+    'dispatch',
+  ]);
+  const dispatchMcp = resolveDispatch(mcpModule as unknown as ModuleExports, [
+    'dispatchMcp',
+    'dispatchMCP',
+    'mcpDispatch',
+    'handleMcp',
+    'dispatch',
+  ]);
+  const dispatchUploadPack = resolveDispatch(gitModule as unknown as ModuleExports, [
+    'dispatchUploadPack',
+    'handleUploadPack',
+    'uploadPack',
+    'uploadPackDispatch',
+    'dispatchGitUploadPack',
+  ]);
+  const dispatchReceivePack = resolveDispatch(gitModule as unknown as ModuleExports, [
+    'dispatchReceivePack',
+    'handleReceivePack',
+    'receivePack',
+    'receivePackDispatch',
+    'dispatchGitReceivePack',
+  ]);
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
+  let requestCounter = 0;
+
+  function sendJson(res: ServerResponse, status: number, value: unknown, requestId: string): void {
+    const body = JSON.stringify(value);
+    res.writeHead(status, {
+      'content-type': 'application/json',
+      'x-github-request-id': requestId,
+    });
+    res.end(body);
+  }
+
+  function sendResult(res: ServerResponse, result: DispatchResult, requestId: string): void {
+    const headers: Record<string, string> = { ...result.headers };
+    headers['x-github-request-id'] = requestId;
+    if (headers['content-type'] === undefined && typeof result.body === 'string') {
+      headers['content-type'] = 'application/json';
+    }
+    res.writeHead(result.status, headers);
+    res.end(result.body);
+  }
+
+  function route(req: IncomingMessage, res: ServerResponse, body: Buffer, requestId: string): void {
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      sendJson(res, 400, { message: 'Bad Request' }, requestId);
       return;
     }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
+    const method = (req.method ?? 'GET').toUpperCase();
+    const pathname = url.pathname;
+    const segments = pathname
+      .split('/')
+      .filter((part) => part.length > 0)
+      .map(decodeSegment);
+    const query = parseQuery(url.searchParams);
+    const headerValue = req.headers.authorization;
+    const authorization = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+    // The Link headers must carry absolute URLs on the entry's own origin
+    // (the conformance client refuses to follow a relative next link), so
+    // the origin the request arrived on is folded into the query object.
+    const host = req.headers.host;
+    if (typeof host === 'string' && host !== '') {
+      query['__origin'] = `http://${host}`;
+    }
+    // The shared dispatch shape carries no headers, so the one header a git
+    // handler needs — Git-Protocol: version=2, which asks for the protocol v2
+    // advertisement — is folded into the query object for it to read.
+    const gitProtocol = req.headers['git-protocol'];
+    if (typeof gitProtocol === 'string' && gitProtocol !== '') {
+      query['git-protocol'] = gitProtocol;
     }
 
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
-  });
+    try {
+      if (method === 'GET' && pathname === '/healthz') {
+        sendJson(res, 200, { ok: true }, requestId);
+        return;
+      }
+
+      if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
+        const restSegments = segments.slice(2);
+        sendResult(res, dispatchRest(store, method, restSegments, query, authorization, body), requestId);
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/api/graphql') {
+        sendResult(res, dispatchGraphQL(store, method, [], query, authorization, body), requestId);
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/mcp') {
+        sendResult(res, dispatchMcp(store, method, [], query, authorization, body), requestId);
+        return;
+      }
+
+      if (segments.length >= 2 && (segments[1] as string).endsWith('.git')) {
+        const gitSegments = segments.slice(2);
+        const service = query['service'];
+        if (method === 'GET' && gitSegments[0] === 'info' && gitSegments[1] === 'refs') {
+          if (service === 'git-receive-pack') {
+            sendResult(res, dispatchReceivePack(store, method, segments, query, authorization, body), requestId);
+          } else {
+            sendResult(res, dispatchUploadPack(store, method, segments, query, authorization, body), requestId);
+          }
+          return;
+        }
+        if (method === 'POST' && gitSegments[0] === 'git-upload-pack') {
+          sendResult(res, dispatchUploadPack(store, method, segments, query, authorization, body), requestId);
+          return;
+        }
+        if (method === 'POST' && gitSegments[0] === 'git-receive-pack') {
+          sendResult(res, dispatchReceivePack(store, method, segments, query, authorization, body), requestId);
+          return;
+        }
+        sendJson(res, 404, { message: 'Not Found' }, requestId);
+        return;
+      }
+
+      sendJson(res, 404, { message: 'Not Found' }, requestId);
+    } catch (err) {
+      process.stderr.write(`dispatch error: ${err instanceof Error ? err.message : String(err)}\n`);
+      if (!res.headersSent) {
+        sendJson(res, 500, { message: 'Internal Server Error' }, requestId);
+      } else {
+        res.end();
+      }
+    }
+  }
+
+  return (req: IncomingMessage, res: ServerResponse): void => {
+    const requestId = `req-${++requestCounter}`;
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer | string) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    req.on('error', () => {
+      if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' }, requestId);
+    });
+    req.on('end', () => {
+      route(req, res, Buffer.concat(chunks), requestId);
+    });
+  };
 }
