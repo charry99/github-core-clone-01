@@ -870,13 +870,29 @@ function isAncestor(repo: RepoRecord, ancestor: string, descendant: string): boo
   return false;
 }
 
+/** Objects whose whole closure was verified present in the store. Objects are
+ * never deleted (only whole repos are), so a verified closure stays verified:
+ * a later push can prune its walk at any of them instead of re-walking the
+ * whole history. */
+const closureVerified = new WeakMap<object, Set<string>>();
+
+function verifiedClosureSet(repo: RepoRecord): Set<string> {
+  let set = closureVerified.get(repo);
+  if (set === undefined) {
+    set = new Set<string>();
+    closureVerified.set(repo, set);
+  }
+  return set;
+}
+
 /** The first object id the tip's closure references that the store lacks, or null. */
 function missingClosureObject(repo: RepoRecord, tip: string): string | null {
+  const verified = verifiedClosureSet(repo);
   const queue: string[] = [peelTag(repo, tip)];
   const seen = new Set<string>();
   while (queue.length > 0) {
     const oid = queue.pop() as string;
-    if (seen.has(oid)) continue;
+    if (seen.has(oid) || verified.has(oid)) continue;
     seen.add(oid);
     const obj = repo.objects.get(oid);
     if (!obj) return oid;
@@ -893,6 +909,7 @@ function missingClosureObject(repo: RepoRecord, tip: string): string | null {
       }
     }
   }
+  for (const oid of seen) verified.add(oid);
   return null;
 }
 
